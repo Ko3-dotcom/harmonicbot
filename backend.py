@@ -101,6 +101,73 @@ def all_coins():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
+# Known bStock symbols on Binance (tokenized stocks)
+BSTOCKS_KNOWN = [
+    {"symbol":"NVDABUSDT",  "name":"NVIDIA",       "sector":"Tech"},
+    {"symbol":"TSLABUSDT",  "name":"Tesla",         "sector":"EV"},
+    {"symbol":"CRCLBUSDT",  "name":"Circle",        "sector":"Fintech"},
+    {"symbol":"MUBUSDT",    "name":"Micron",        "sector":"Semiconductors"},
+    {"symbol":"SNDKBUSDT",  "name":"Sandisk",       "sector":"Storage"},
+    {"symbol":"AAPLBUSDT",  "name":"Apple",         "sector":"Tech"},
+    {"symbol":"MSFTBUSDT",  "name":"Microsoft",     "sector":"Tech"},
+    {"symbol":"GOOGBUSDT",  "name":"Alphabet",      "sector":"Tech"},
+    {"symbol":"AMZNBUSDT",  "name":"Amazon",        "sector":"Commerce"},
+    {"symbol":"METABUSDT",  "name":"Meta",          "sector":"Social"},
+    {"symbol":"COINBUSDT",  "name":"Coinbase",      "sector":"Crypto"},
+    {"symbol":"SPYBUSDT",   "name":"S&P500 ETF",    "sector":"Index"},
+    {"symbol":"QQBBUSDT",   "name":"Nasdaq ETF",    "sector":"Index"},
+    {"symbol":"BRKBBUSDT",  "name":"Berkshire B",   "sector":"Finance"},
+    {"symbol":"JPMBBUSDT",  "name":"JPMorgan",      "sector":"Finance"},
+]
+
+@app.route("/api/bstocks", methods=["GET"])
+def get_bstocks():
+    """
+    Return available bStock symbols with live prices from Binance.
+    Falls back gracefully if symbol not listed on user's account.
+    """
+    testnet = request.args.get("testnet","false") == "true"
+    base    = TESTNET_BASE if testnet else BINANCE_BASE
+    try:
+        r       = requests.get(f"{base}/api/v3/ticker/24hr", timeout=15)
+        tickers = {t["symbol"]: t for t in r.json()}
+        result  = []
+        for s in BSTOCKS_KNOWN:
+            sym = s["symbol"]
+            if sym in tickers:
+                t = tickers[sym]
+                result.append({
+                    "symbol":  sym,
+                    "name":    s["name"],
+                    "sector":  s["sector"],
+                    "price":   float(t["lastPrice"]),
+                    "change":  float(t["priceChangePercent"]),
+                    "volume":  float(t["quoteVolume"]),
+                    "type":    "bstock",
+                })
+        # Known crypto that happen to end in BUSDT pattern — exclude them
+        CRYPTO_EXCEPTIONS = {"BNBUSDT","BTCUSDT","ETHUSDT","LTCUSDT","XRPUSDT"}
+        # Auto-detect any other BUSDT tokens not in our known list
+        # Must have 4+ chars before BUSDT (e.g. NVDABUSDT=9 chars, BNBUSDT=7 but excluded)
+        known_syms = {s["symbol"] for s in BSTOCKS_KNOWN}
+        for sym, t in tickers.items():
+            if sym in CRYPTO_EXCEPTIONS: continue
+            if sym in known_syms: continue
+            if sym.endswith("BUSDT") and len(sym) >= 8 and float(t["quoteVolume"]) > 0:
+                result.append({
+                    "symbol": sym,
+                    "name":   sym.replace("BUSDT",""),
+                    "sector": "TradFi",
+                    "price":  float(t["lastPrice"]),
+                    "change": float(t["priceChangePercent"]),
+                    "volume": float(t["quoteVolume"]),
+                    "type":   "bstock",
+                })
+        result.sort(key=lambda x: x["volume"], reverse=True)
+        return jsonify({"ok": True, "bstocks": result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
 # ─── ACCOUNT ───────────────────────────────────────────────────────────────
 
 @app.route("/api/account", methods=["POST"])
@@ -1514,6 +1581,88 @@ def telegram_send_confluence():
     ok, resp = tg_send(d["token"], d["chat_id"],
                        tg_confluence_msg(d["symbol"], d["direction"], d["timeframes"]))
     return jsonify({"ok": ok})
+
+def tg_session_report_msg(data):
+    """Build a session summary report message for Telegram."""
+    signals      = data.get("signals", [])
+    trades       = data.get("trades", [])
+    duration_min = data.get("duration_min", 0)
+    balance      = data.get("balance", 0)
+    start_bal    = data.get("start_balance", 0)
+
+    # Signal stats
+    total_sigs   = len(signals)
+    bull_sigs    = len([s for s in signals if s.get("direction")==1])
+    bear_sigs    = total_sigs - bull_sigs
+    avg_score    = round(sum(s.get("score",0) for s in signals)/total_sigs, 1) if total_sigs else 0
+    strong_sigs  = len([s for s in signals if s.get("score",0)>=80])
+
+    # Pattern breakdown
+    pat_count = {}
+    for s in signals:
+        p = s.get("pattern","?")
+        pat_count[p] = pat_count.get(p,0)+1
+    top_pat = max(pat_count, key=pat_count.get) if pat_count else "—"
+
+    # Trade stats
+    closed  = [t for t in trades if t.get("status") in ["WIN","LOSS"]]
+    wins    = [t for t in closed if t.get("status")=="WIN"]
+    losses  = [t for t in closed if t.get("status")=="LOSS"]
+    open_tr = [t for t in trades if t.get("status")=="OPEN"]
+    total_pnl = sum(float(t.get("pnl",0) or 0) for t in closed)
+    win_rate  = round(len(wins)/len(closed)*100,1) if closed else 0
+
+    # Duration
+    h = duration_min // 60
+    m = duration_min % 60
+    duration_str = f"{h}h {m}m" if h else f"{m}m"
+
+    # P&L vs balance
+    pnl_str = f"{'+' if total_pnl>=0 else ''}{total_pnl:.2f} USDT"
+    bal_str  = f"{balance:.2f} USDT" if balance else "—"
+
+    # Emoji for overall performance
+    perf_emoji = "🔥" if win_rate>=70 else "✅" if win_rate>=50 else "⚠" if closed else "📊"
+
+    lines = [
+        f"{perf_emoji} <b>SESSION REPORT</b> — HarmonicBot",
+        f"⏱ Duration: {duration_str}",
+        f"",
+        f"📊 <b>SIGNALS</b>",
+        f"   Total:      {total_sigs}  (🐂 {bull_sigs} bull / 🐻 {bear_sigs} bear)",
+        f"   Avg Score:  {avg_score}/100",
+        f"   🔥 Strong:  {strong_sigs} signals (score ≥80)",
+        f"   Top Pattern: {top_pat} ({pat_count.get(top_pat,0)}×)",
+        f"",
+    ]
+
+    if closed:
+        lines += [
+            f"💼 <b>TRADES</b>",
+            f"   Closed:    {len(closed)}  (✅ {len(wins)}W / ❌ {len(losses)}L)",
+            f"   Win Rate:  {win_rate}%",
+            f"   P&L:       {pnl_str}",
+        ]
+        if open_tr:
+            lines.append(f"   Open:      {len(open_tr)} position(s) still running")
+        lines.append(f"")
+    elif open_tr:
+        lines += [f"💼 <b>TRADES</b>", f"   {len(open_tr)} open position(s) — no closed yet", f""]
+
+    lines += [
+        f"💰 <b>BALANCE</b>",
+        f"   Current: {bal_str}",
+        f"",
+        f"⏰ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ]
+    return "\n".join(lines)
+
+@app.route("/api/telegram/send_report", methods=["POST"])
+def telegram_send_report():
+    d = request.json
+    ok, resp = tg_send(d["token"], d["chat_id"],
+                       tg_session_report_msg(d.get("data",{})))
+    return jsonify({"ok": ok, "error": resp.get("description","") if not ok else ""})
 
 if __name__=="__main__":
     port = int(os.environ.get("PORT", 5000))
