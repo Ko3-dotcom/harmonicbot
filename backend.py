@@ -145,24 +145,19 @@ def get_bstocks():
                     "volume":  float(t["quoteVolume"]),
                     "type":    "bstock",
                 })
-        # Known crypto that happen to end in BUSDT pattern — exclude them
-        CRYPTO_EXCEPTIONS = {"BNBUSDT","BTCUSDT","ETHUSDT","LTCUSDT","XRPUSDT"}
-        # Auto-detect any other BUSDT tokens not in our known list
-        # Must have 4+ chars before BUSDT (e.g. NVDABUSDT=9 chars, BNBUSDT=7 but excluded)
-        known_syms = {s["symbol"] for s in BSTOCKS_KNOWN}
+        # Also auto-detect any other BUSDT tokens not in our known list
         for sym, t in tickers.items():
-            if sym in CRYPTO_EXCEPTIONS: continue
-            if sym in known_syms: continue
-            if sym.endswith("BUSDT") and len(sym) >= 8 and float(t["quoteVolume"]) > 0:
-                result.append({
-                    "symbol": sym,
-                    "name":   sym.replace("BUSDT",""),
-                    "sector": "TradFi",
-                    "price":  float(t["lastPrice"]),
-                    "change": float(t["priceChangePercent"]),
-                    "volume": float(t["quoteVolume"]),
-                    "type":   "bstock",
-                })
+            if sym.endswith("BUSDT") and sym not in [s["symbol"] for s in BSTOCKS_KNOWN]:
+                if float(t["quoteVolume"]) > 0:
+                    result.append({
+                        "symbol": sym,
+                        "name":   sym.replace("BUSDT",""),
+                        "sector": "TradFi",
+                        "price":  float(t["lastPrice"]),
+                        "change": float(t["priceChangePercent"]),
+                        "volume": float(t["quoteVolume"]),
+                        "type":   "bstock",
+                    })
         result.sort(key=lambda x: x["volume"], reverse=True)
         return jsonify({"ok": True, "bstocks": result})
     except Exception as e:
